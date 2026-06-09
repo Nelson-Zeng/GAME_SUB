@@ -5,11 +5,10 @@
 并在指定时间自动@提醒订阅用户。
 
 指令:
-    /订阅游戏 <游戏名>        - 订阅游戏发售日期提醒
-    /订阅游戏 <游戏名> <延时> - 测试订阅（延时秒后执行检查并输出结果）
-    /订阅更新 <游戏名>        - 订阅游戏版本更新提醒
-    /订阅列表                 - 查看当前群的所有订阅
-    /移除订阅 <游戏名>        - 移除指定游戏的所有订阅
+    /订阅发售 <游戏名> [延时]    - 订阅游戏发售日期提醒（可选延时秒数测试）
+    /订阅更新 <游戏名> [延时]    - 订阅游戏版本更新提醒（可选延时秒数测试）
+    /游戏订阅列表                - 查看当前群的所有订阅
+    /移除订阅 <游戏名>           - 移除指定游戏的所有订阅
 """
 
 import asyncio
@@ -18,10 +17,13 @@ import os
 from datetime import datetime, timedelta
 
 import aiohttp
+import jinja2
+from playwright.async_api import async_playwright
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star
+from astrbot.core.utils.io import save_temp_img
 import astrbot.api.message_components as Comp
 
 
@@ -89,8 +91,60 @@ SUBSCRIPTION_LIST_HTML = """
 </div>
 """
 
+# ---------------------------------------------------------------------------
+# HTML 模板：测试检索结果
+# ---------------------------------------------------------------------------
+TEST_RESULT_HTML = """
+<div style="font-family: 'Microsoft YaHei', 'PingFang SC', sans-serif;
+            padding: 24px 28px; min-width: 380px; max-width: 520px;
+            background: #ffffff; color: #333; border-radius: 8px;">
+  <h1 style="font-size: 20px; color: #4361ee; margin: 0 0 16px 0;
+             padding-bottom: 10px; border-bottom: 2px solid #4361ee;">
+    🧪 测试检索结果
+  </h1>
+  <div style="font-size: 15px; line-height: 1.8;">
+    <p style="margin: 8px 0;"><strong>🎮 {{ game_name }}</strong></p>
+    <p style="margin: 4px 0; color: #555;">📅 {{ label }}: <strong style="color: #333;">{{ date }}</strong></p>
+    {% if status %}<p style="margin: 4px 0; color: #555;">📌 状态: <strong style="color: #333;">{{ status }}</strong></p>{% endif %}
+    {% if days_diff is not none %}
+      <p style="margin: 6px 0 0 0;">
+      {% if days_diff > 0 %}
+        ⏳ 距{{ label_text }}还有 <strong style="color: #e67e22;">{{ days_diff }}</strong> 天
+      {% elif days_diff == 0 %}
+        🎉 今天就是{{ label_text }}日！
+      {% else %}
+        📦 已于 <strong style="color: #888;">{{ days_diff|abs }}</strong> 天前{{ label_text }}
+      {% endif %}
+      </p>
+    {% endif %}
+    {% if msg %}<p style="margin: 6px 0 0 0; color: #e74c3c;">{{ msg }}</p>{% endif %}
+  </div>
+</div>
+"""
 
 # ---------------------------------------------------------------------------
+# HTML 模板：游戏提醒通知
+# ---------------------------------------------------------------------------
+NOTIFICATION_HTML = """
+<div style="font-family: 'Microsoft YaHei', 'PingFang SC', sans-serif;
+            padding: 20px 24px; min-width: 380px; max-width: 560px;
+            background: #ffffff; color: #333; border-radius: 8px;">
+  <h1 style="font-size: 18px; color: {{ header_color }}; margin: 0 0 14px 0;
+             padding-bottom: 8px; border-bottom: 2px solid {{ header_color }};">
+    {{ header_icon }} {{ title }}
+  </h1>
+  <div style="font-size: 14px; line-height: 1.7;">
+    {% for item in items %}
+    <div style="padding: 8px 12px; margin-bottom: 6px;
+                background: {{ item.bg }}; border-radius: 6px;
+                border-left: 3px solid {{ item.border }};">
+      <strong>{{ item.game_name }}</strong>
+      <span style="color: #555; margin-left: 6px;">{{ item.detail }}</span>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+"""
 # 插件主类
 # ---------------------------------------------------------------------------
 class GameSubscriptionPlugin(Star):
@@ -112,6 +166,15 @@ class GameSubscriptionPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+
+        # Playwright 浏览器
+        self._playwright = None
+        self._browser = None
+        self._browser_lock = asyncio.Lock()
+
+        # 图片渲染配置
+        self._img_viewport_width = 680
+        self._img_device_scale = 2.0
 
         # 持久化数据目录（AstrBot 根目录下的 data/）
         self.data_dir = os.path.join("data", "astrbot_plugin_game_subscription")
@@ -141,6 +204,92 @@ class GameSubscriptionPlugin(Star):
             return sorted([int(d.strip()) for d in str(value).split(",") if d.strip()])
         except (ValueError, AttributeError):
             return [0, 1, 3, 7]
+
+    # ------------------------------------------------------------------
+    # Playwright 浏览器生命周期
+    # ------------------------------------------------------------------
+    async def initialize(self):
+        """插件启动时初始化 Playwright Chromium 浏览器"""
+        try:
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"],
+            )
+            logger.info("[GameSub] Chromium 浏览器已启动")
+        except Exception as e:
+            logger.warning(f"[GameSub] 浏览器启动失败，将降级为纯文本模式: {e}")
+
+    async def terminate(self):
+        """插件卸载时关闭浏览器"""
+        try:
+            if self._browser:
+                await self._browser.close()
+            if self._playwright:
+                await self._playwright.stop()
+            logger.info("[GameSub] Chromium 已关闭")
+        except Exception as e:
+            logger.warning(f"[GameSub] 浏览器关闭异常: {e}")
+
+    async def _get_browser(self):
+        """获取或重新创建浏览器实例"""
+        if self._browser and self._browser.is_connected():
+            return self._browser
+        async with self._browser_lock:
+            if self._browser and self._browser.is_connected():
+                return self._browser
+            if not self._playwright:
+                self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"],
+            )
+            logger.info("[GameSub] Chromium 已重新启动")
+            return self._browser
+
+    def _build_html(self, template_str: str, data: dict) -> str:
+        """渲染 Jinja2 模板并包装为完整 HTML 文档"""
+        tpl = jinja2.Template(template_str)
+        body_html = tpl.render(**data)
+        return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
+       font-size:15px;color:#333;padding:20px;margin:0;
+       background:#ffffff;}}
+*{{box-sizing:border-box;margin:0;padding:0}}
+</style>
+</head>
+<body>{body_html}</body>
+</html>"""
+
+    async def _render_html_to_image(self, template_str: str, data: dict) -> str:
+        """将 HTML 模板渲染为 PNG 图片，返回图片文件路径"""
+        html = self._build_html(template_str, data)
+        browser = await self._get_browser()
+        page = await browser.new_page(
+            viewport={"width": self._img_viewport_width, "height": 1200},
+            device_scale_factor=self._img_device_scale,
+        )
+        try:
+            await page.set_content(html, wait_until="networkidle", timeout=15000)
+            await page.wait_for_timeout(300)
+            dimensions = await page.evaluate(
+                """() => {
+                    const r = document.body.getBoundingClientRect();
+                    return { width: r.width, height: r.height };
+                }"""
+            )
+            await page.set_viewport_size({
+                "width": self._img_viewport_width,
+                "height": int(dimensions["height"]),
+            })
+            screenshot_bytes = await page.screenshot(type="png")
+        finally:
+            await page.close()
+        return save_temp_img(screenshot_bytes)
 
     # ------------------------------------------------------------------
     # 数据持久化
@@ -255,9 +404,9 @@ class GameSubscriptionPlugin(Star):
     # ==================================================================
 
     # ------------------------------------------------------------------
-    # /订阅游戏 <游戏名> [延时秒数]
+    # /订阅发售 <游戏名> [延时秒数]
     # ------------------------------------------------------------------
-    @filter.command("订阅游戏")
+    @filter.command("订阅发售")
     async def subscribe_game(
         self, event: AstrMessageEvent, game_name: str, delay: int = 0
     ):
@@ -301,11 +450,13 @@ class GameSubscriptionPlugin(Star):
         )
 
     # ------------------------------------------------------------------
-    # /订阅更新 <游戏名>
+    # /订阅更新 <游戏名> [延时秒数]
     # ------------------------------------------------------------------
     @filter.command("订阅更新")
-    async def subscribe_update(self, event: AstrMessageEvent, game_name: str):
-        """订阅游戏版本更新提醒"""
+    async def subscribe_update(
+        self, event: AstrMessageEvent, game_name: str, delay: int = 0
+    ):
+        """订阅游戏版本更新提醒，可选传入延时秒数进行测试"""
         user_id = event.get_sender_id()
         group_id = event.get_group_id()
         if not group_id:
@@ -314,12 +465,25 @@ class GameSubscriptionPlugin(Star):
 
         umo = event.unified_msg_origin
 
+        # 测试模式：带延时，不加入订阅列表，直接执行检索
+        if delay > 0:
+            yield event.plain_result(
+                f"🧪 测试模式：正在检索《{game_name}》...\n"
+                f"⏱️ 将在 {delay} 秒后输出结果"
+            )
+            asyncio.create_task(
+                self._delayed_test(game_name, "update", umo, user_id, delay, event)
+            )
+            return
+
+        # 防重复订阅
         if self._is_user_subscribed_update(game_name, user_id, group_id):
             yield event.plain_result(
                 f"⚠️ 你已经在本群订阅了《{game_name}》的更新提醒"
             )
             return
 
+        # 写入订阅
         self._add_update_sub(game_name, user_id, group_id, umo)
         logger.info(
             f"[GameSub] 用户 {user_id} 在群 {group_id} 订阅了游戏更新: {game_name}"
@@ -360,14 +524,14 @@ class GameSubscriptionPlugin(Star):
         if not release_subs and not update_subs:
             yield event.plain_result(
                 "📋 当前群暂无任何游戏订阅\n"
-                "使用 /订阅游戏 游戏名 来订阅游戏发售提醒\n"
+                "使用 /订阅发售 游戏名 来订阅游戏发售提醒\n"
                 "使用 /订阅更新 游戏名 来订阅游戏更新提醒"
             )
             return
 
         # 优先使用图片渲染，失败时降级为纯文本
         try:
-            url = await self.html_render(
+            img_path = await self._render_html_to_image(
                 SUBSCRIPTION_LIST_HTML,
                 {
                     "release_subs": release_subs,
@@ -375,7 +539,7 @@ class GameSubscriptionPlugin(Star):
                     "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
                 },
             )
-            yield event.image_result(url)
+            yield event.image_result(img_path)
         except Exception as exc:
             logger.warning(f"[GameSub] 图片渲染失败，降级为纯文本: {exc}")
             lines = ["📋 游戏订阅列表\n"]
@@ -445,6 +609,32 @@ class GameSubscriptionPlugin(Star):
             yield event.plain_result(f"⚠️ 本群没有对《{game_name}》的任何订阅")
 
     # ==================================================================
+    # 图片渲染辅助
+    # ==================================================================
+    async def _send_image(
+        self,
+        umo: str,
+        user_id: str,
+        html_template: str,
+        data: dict,
+        at_user: bool = True,
+    ):
+        """渲染 HTML 为图片并发送到会话"""
+        try:
+            img_path = await self._render_html_to_image(html_template, data)
+            message_chain = MessageChain()
+            chain = []
+            if at_user:
+                chain.append(Comp.At(qq=user_id))
+            chain.append(Comp.Image.fromFileSystem(img_path))
+            message_chain.chain = chain
+            await self.context.send_message(umo, message_chain)
+            return True
+        except Exception as exc:
+            logger.warning(f"[GameSub] 图片渲染发送失败: {exc}")
+            return False
+
+    # ==================================================================
     # 延时测试
     # ==================================================================
     async def _delayed_test(
@@ -460,62 +650,78 @@ class GameSubscriptionPlugin(Star):
         await asyncio.sleep(delay)
         try:
             today = datetime.now()
-            today_str = today.strftime("%Y-%m-%d")
+
+            data = {"game_name": "", "label": "", "date": "",
+                     "status": "", "days_diff": None,
+                     "msg": "", "label_text": ""}
 
             if sub_type == "release":
                 result = await self._batch_search_release([game_name], umo, event)
                 if game_name in result:
                     info = result[game_name]
-                    release_date_str = info.get("release_date", "未知")
-                    msg = (
-                        f"🧪 测试检索结果\n\n"
-                        f"🎮 {game_name}\n"
-                        f"📅 预计发售日期: {release_date_str}"
-                    )
-                    if info.get("status"):
-                        msg += f"\n📌 状态: {info['status']}"
-                    # 计算距今天数
+                    date_str = info.get("release_date", "未知")
+                    data.update({
+                        "game_name": game_name,
+                        "label": "预计发售日期",
+                        "date": date_str,
+                        "status": info.get("status", ""),
+                        "label_text": "发售",
+                    })
                     try:
-                        release_date = datetime.strptime(
-                            release_date_str, "%Y-%m-%d"
-                        ).date()
-                        diff = (release_date - today.date()).days
-                        if diff > 0:
-                            msg += f"\n⏳ 距发售还有 {diff} 天"
-                        elif diff == 0:
-                            msg += "\n🎉 今天就是发售日！"
-                        else:
-                            msg += f"\n📦 已于 {abs(diff)} 天前发售"
+                        dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+                        data["days_diff"] = (dt - today.date()).days
                     except ValueError:
                         pass
                 else:
-                    msg = (
-                        f"🧪 测试检索结果\n\n"
-                        f"🎮 {game_name}\n"
-                        f"❌ 未能获取到该游戏的发售日期信息"
-                    )
+                    data["game_name"] = game_name
+                    data["msg"] = "❌ 未能获取到该游戏的发售日期信息"
             else:
                 result = await self._batch_search_update([game_name], umo, event)
                 if game_name in result:
                     info = result[game_name]
-                    update_date_str = info.get("update_date", "未知")
-                    msg = (
-                        f"🧪 测试检索结果\n\n"
-                        f"🎮 {game_name}\n"
-                        f"📅 最近更新日期: {update_date_str}"
-                    )
-                    if info.get("version"):
-                        msg += f"\n📌 最新版本: {info['version']}"
+                    date_str = info.get("update_date", "未知")
+                    data.update({
+                        "game_name": game_name,
+                        "label": "最近更新日期",
+                        "date": date_str,
+                        "status": info.get("version", ""),
+                        "label_text": "更新",
+                    })
+                    try:
+                        dt = datetime.strptime(date_str, "%Y-%m-%d").date()
+                        data["days_diff"] = (dt - today.date()).days
+                    except ValueError:
+                        pass
                 else:
-                    msg = (
-                        f"🧪 测试检索结果\n\n"
-                        f"🎮 {game_name}\n"
-                        f"❌ 未能获取到该游戏的更新信息"
-                    )
+                    data["game_name"] = game_name
+                    data["msg"] = "❌ 未能获取到该游戏的更新信息"
 
-            message_chain = MessageChain()
-            message_chain.chain = [Comp.At(qq=user_id), Comp.Plain(f" {msg}")]
-            await self.context.send_message(umo, message_chain)
+            # 优先图片，降级纯文本
+            sent = await self._send_image(umo, user_id, TEST_RESULT_HTML, data)
+            if not sent:
+                # 纯文本兜底
+                lines = [f"🧪 测试检索结果", f"🎮 {data['game_name']}"]
+                if data["date"]:
+                    lines.append(f"📅 {data['label']}: {data['date']}")
+                if data["status"]:
+                    lines.append(f"📌 {data['status']}")
+                if data["msg"]:
+                    lines.append(data["msg"])
+                elif data["days_diff"] is not None:
+                    d = data["days_diff"]
+                    lt = data["label_text"]
+                    if d > 0:
+                        lines.append(f"⏳ 距{lt}还有 {d} 天")
+                    elif d == 0:
+                        lines.append(f"🎉 今天就是{lt}日！")
+                    else:
+                        lines.append(f"📦 已于 {abs(d)} 天前{lt}")
+                message_chain = MessageChain()
+                message_chain.chain = [
+                    Comp.At(qq=user_id),
+                    Comp.Plain(f" {chr(10).join(lines)}"),
+                ]
+                await self.context.send_message(umo, message_chain)
 
         except Exception as exc:
             logger.error(f"[GameSub] 延时测试执行失败: {exc}")
@@ -1104,32 +1310,60 @@ class GameSubscriptionPlugin(Star):
 
         for umo, items in grouped.items():
             try:
-                chain = []
+                # 构建图片数据
+                game_items = []
+                user_ids = set()
                 for item in items:
+                    user_ids.add(item["user_id"])
                     days = item["days_until"]
                     if days == 0:
-                        day_text = "🎉 今天发售！"
+                        detail = "🎉 今天发售！"
                     elif days > 0:
-                        day_text = f"⏳ 还有 {days} 天"
+                        detail = f"⏳ 还有 {days} 天"
                     else:
                         continue
 
-                    chain.append(Comp.At(qq=item["user_id"]))
-                    chain.append(
-                        Comp.Plain(
-                            f" 🎮《{item['game_name']}》{day_text}"
-                            f"（发售日期: {item['release_date_str']}）\n"
-                        )
-                    )
+                    game_items.append({
+                        "game_name": f"🎮 {item['game_name']}",
+                        "detail": f"{detail}（发售日期: {item['release_date_str']}）",
+                        "bg": "#f0f4ff",
+                        "border": "#4361ee",
+                        "user_id": item["user_id"],
+                    })
 
-                if chain:
-                    header = [Comp.Plain("📢 游戏发售提醒\n")]
-                    message_chain = MessageChain()
-                    message_chain.chain = header + chain
-                    await self.context.send_message(umo, message_chain)
-                    logger.info(
-                        f"[GameSub] 已发送 {len(items)} 条发售提醒到 {umo}"
-                    )
+                if not game_items:
+                    continue
+
+                # 渲染图片
+                img_data = {
+                    "header_color": "#4361ee",
+                    "header_icon": "📢",
+                    "title": "游戏发售提醒",
+                    "items": game_items,
+                }
+                sent = await self._send_image(
+                    umo, "", NOTIFICATION_HTML, img_data, at_user=False
+                )
+                if sent:
+                    # 单独发送 @ 提及（图片之后）
+                    at_chain = [Comp.At(qq=uid) for uid in user_ids]
+                    at_chain.append(Comp.Plain(" 以上是今日游戏发售提醒，请查看 👆"))
+                    msg = MessageChain()
+                    msg.chain = at_chain
+                    await self.context.send_message(umo, msg)
+                else:
+                    # 降级为纯文本
+                    chain = []
+                    for item in game_items:
+                        chain.append(Comp.At(qq=item.get("user_id", "")))
+                        chain.append(Comp.Plain(f" 🎮《{item['game_name']}》{item['detail']}\n"))
+                    if chain:
+                        header = [Comp.Plain("📢 游戏发售提醒\n")]
+                        message_chain = MessageChain()
+                        message_chain.chain = header + chain
+                        await self.context.send_message(umo, message_chain)
+
+                logger.info(f"[GameSub] 已发送 {len(items)} 条发售提醒到 {umo}")
             except Exception as exc:
                 logger.error(f"[GameSub] 发送发售提醒失败 ({umo}): {exc}")
 
@@ -1152,26 +1386,60 @@ class GameSubscriptionPlugin(Star):
 
         for umo, items in grouped.items():
             try:
-                chain = []
+                # 构建图片数据
+                game_items = []
+                user_ids = set()
                 for item in items:
-                    chain.append(Comp.At(qq=item["user_id"]))
+                    user_ids.add(item["user_id"])
                     version_text = (
                         f"（版本: {item['version']}）" if item["version"] else ""
                     )
-                    chain.append(
-                        Comp.Plain(
-                            f" 🔄《{item['game_name']}》今日有更新！{version_text}\n"
-                        )
-                    )
+                    game_items.append({
+                        "game_name": f"🔄 {item['game_name']}",
+                        "detail": f"今日有更新！{version_text}",
+                        "bg": "#fff0f6",
+                        "border": "#f72585",
+                    })
 
-                if chain:
-                    header = [Comp.Plain("📢 游戏更新提醒\n")]
-                    message_chain = MessageChain()
-                    message_chain.chain = header + chain
-                    await self.context.send_message(umo, message_chain)
-                    logger.info(
-                        f"[GameSub] 已发送 {len(items)} 条更新提醒到 {umo}"
-                    )
+                if not game_items:
+                    continue
+
+                # 渲染图片
+                img_data = {
+                    "header_color": "#f72585",
+                    "header_icon": "📢",
+                    "title": "游戏更新提醒",
+                    "items": game_items,
+                }
+                sent = await self._send_image(
+                    umo, "", NOTIFICATION_HTML, img_data, at_user=False
+                )
+                if sent:
+                    at_chain = [Comp.At(qq=uid) for uid in user_ids]
+                    at_chain.append(Comp.Plain(" 以上是今日游戏更新提醒，请查看 👆"))
+                    msg = MessageChain()
+                    msg.chain = at_chain
+                    await self.context.send_message(umo, msg)
+                else:
+                    # 降级为纯文本
+                    chain = []
+                    for item in items:
+                        chain.append(Comp.At(qq=item["user_id"]))
+                        version_text = (
+                            f"（版本: {item['version']}）" if item["version"] else ""
+                        )
+                        chain.append(
+                            Comp.Plain(
+                                f" 🔄《{item['game_name']}》今日有更新！{version_text}\n"
+                            )
+                        )
+                    if chain:
+                        header = [Comp.Plain("📢 游戏更新提醒\n")]
+                        message_chain = MessageChain()
+                        message_chain.chain = header + chain
+                        await self.context.send_message(umo, message_chain)
+
+                logger.info(f"[GameSub] 已发送 {len(items)} 条更新提醒到 {umo}")
             except Exception as exc:
                 logger.error(f"[GameSub] 发送更新提醒失败 ({umo}): {exc}")
 
