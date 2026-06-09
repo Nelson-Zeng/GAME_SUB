@@ -460,7 +460,7 @@ class GameSubscriptionPlugin(Star):
             today_str = today.strftime("%Y-%m-%d")
 
             if sub_type == "release":
-                result = await self._batch_search_release([game_name])
+                result = await self._batch_search_release([game_name], umo)
                 if game_name in result:
                     info = result[game_name]
                     release_date_str = info.get("release_date", "未知")
@@ -492,7 +492,7 @@ class GameSubscriptionPlugin(Star):
                         f"❌ 未能获取到该游戏的发售日期信息"
                     )
             else:
-                result = await self._batch_search_update([game_name])
+                result = await self._batch_search_update([game_name], umo)
                 if game_name in result:
                     info = result[game_name]
                     update_date_str = info.get("update_date", "未知")
@@ -620,14 +620,25 @@ class GameSubscriptionPlugin(Star):
     # ------------------------------------------------------------------
     # LLM 批量检索
     # ------------------------------------------------------------------
-    async def _get_provider(self):
-        """获取 LLM 提供商（优先使用配置指定的，否则用默认）"""
+    async def _get_provider(self, umo: str = None):
+        """获取 LLM 提供商
+
+        - 若配置文件指定了 search_provider_id，优先使用该提供商
+        - 若传入 umo，使用该会话的当前提供商
+        - 否则从所有提供商中取第一个可用
+        """
         provider_id = self.config.get("search_provider_id", "")
         if provider_id:
             return self.context.get_provider_by_id(provider_id)
-        return self.context.get_using_provider()
+        if umo:
+            return self.context.get_using_provider(umo=umo)
+        # 无 umo 时：遍历所有提供商取第一个
+        all_providers = self.context.get_all_providers()
+        if all_providers:
+            return all_providers[0]
+        return None
 
-    async def _batch_search_release(self, game_names: list) -> dict:
+    async def _batch_search_release(self, game_names: list, umo: str = None) -> dict:
         """批量查询游戏预计发售日期
 
         将所有游戏合并为一次 LLM 请求，减少 API 调用次数。
@@ -635,9 +646,9 @@ class GameSubscriptionPlugin(Star):
         Returns:
             {游戏名: {"release_date": "YYYY-MM-DD", "status": "..."}}
         """
-        provider = await self._get_provider()
+        provider = await self._get_provider(umo)
         if not provider:
-            logger.warning("[GameSub] 未找到可用的 LLM 提供商，跳过检索")
+            logger.warning("[GameSub] 未找到可用的 LLM 提供商，跳过发售检索")
             return {}
 
         games_str = "、".join(game_names)
@@ -671,15 +682,15 @@ class GameSubscriptionPlugin(Star):
             logger.error(f"[GameSub] 批量查询发售日期失败: {exc}")
         return {}
 
-    async def _batch_search_update(self, game_names: list) -> dict:
+    async def _batch_search_update(self, game_names: list, umo: str = None) -> dict:
         """批量查询游戏最近版本更新日期
 
         Returns:
             {游戏名: {"update_date": "YYYY-MM-DD", "version": "..."}}
         """
-        provider = await self._get_provider()
+        provider = await self._get_provider(umo)
         if not provider:
-            logger.warning("[GameSub] 未找到可用的 LLM 提供商，跳过检索")
+            logger.warning("[GameSub] 未找到可用的 LLM 提供商，跳过更新检索")
             return {}
 
         games_str = "、".join(game_names)
