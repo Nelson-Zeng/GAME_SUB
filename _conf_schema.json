@@ -23,10 +23,34 @@
         "default": "7,3,1,0",
         "hint": "在游戏发售前这些天数时发送提醒，0表示发售当天"
     },
-    "search_provider_id": {
-        "description": "搜索用LLM提供商ID（可选）",
+    "tavily_api_key": {
+        "description": "Tavily 搜索 API Key（留空则不使用搜索功能）",
         "type": "string",
         "default": "",
-        "hint": "留空则使用当前会话默认的LLM提供商进行游戏信息检索"
+        "hint": "前往 https://app.tavily.com 获取。设置后插件使用自己的 Tavily 搜索，不再依赖 AstrBot 内置搜索工具"
+    },
+    "search_llm_api_key": {
+        "description": "搜索用 LLM 的 API Key（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "留空则使用 AstrBot 默认 LLM 提供商。设置后搜索提取阶段使用此独立 LLM"
+    },
+    "search_llm_url": {
+        "description": "搜索用 LLM 的 API 地址（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "OpenAI 兼容格式，例如 https://api.openai.com/v1。配合 search_llm_api_key 使用"
+    },
+    "search_llm_model": {
+        "description": "搜索用 LLM 的模型名（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "例如 gpt-4o-mini, deepseek-chat 等。配合 search_llm_api_key 使用"
+    },
+    "search_provider_id": {
+        "description": "搜索用 AstrBot LLM 提供商 ID（可选，兜底用）",
+        "type": "string",
+        "default": "",
+        "hint": "当未配置独立 LLM 时，使用此提供商；留空则使用当前会话默认的 LLM 提供商"
     }
 }

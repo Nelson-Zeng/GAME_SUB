@@ -17,6 +17,8 @@ import json
 import os
 from datetime import datetime, timedelta
 
+import aiohttp
+
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star
@@ -748,6 +750,106 @@ class GameSubscriptionPlugin(Star):
             logger.warning(f"[GameSub] Web Search 查询失败 [{query}]: {exc}")
             return ""
 
+    async def _tavily_search(self, query: str) -> str:
+        """使用配置的 Tavily API Key 直接调用 Tavily 搜索
+
+        不依赖 AstrBot 内置搜索工具，插件自行管理搜索配置。
+        """
+        api_key = self.config.get("tavily_api_key", "")
+        if not api_key:
+            logger.debug("[GameSub] 未配置 tavily_api_key，跳过 Tavily 搜索")
+            return ""
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                payload = {
+                    "api_key": api_key,
+                    "query": query,
+                    "search_depth": "basic",
+                    "include_answer": True,
+                    "max_results": 5,
+                }
+                async with session.post(
+                    "https://api.tavily.com/search",
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status != 200:
+                        logger.warning(
+                            f"[GameSub] Tavily 搜索失败 [{query}]: HTTP {resp.status}"
+                        )
+                        return ""
+                    data = await resp.json()
+
+            # 拼接搜索结果
+            parts = []
+            if data.get("answer"):
+                parts.append(data["answer"])
+            for r in data.get("results", []):
+                title = r.get("title", "")
+                content = r.get("content", "")
+                if title:
+                    parts.append(f"{title}: {content}")
+                elif content:
+                    parts.append(content)
+            result = "\n".join(parts)
+            logger.info(f"[GameSub] Tavily 搜索成功 [{query}]: 获取到 {len(result)} 字符")
+            return result[:2000]  # 限制长度
+        except Exception as exc:
+            logger.warning(f"[GameSub] Tavily 搜索异常 [{query}]: {exc}")
+            return ""
+
+    async def _search_llm_generate(self, prompt: str) -> str:
+        """使用独立的搜索 LLM 配置（OpenAI 兼容格式）生成文本
+
+        如果配置了 search_llm_api_key/url/model，则使用独立的 LLM；
+        否则返回空字符串，让调用方回退到 AstrBot 默认 LLM。
+        """
+        api_key = self.config.get("search_llm_api_key", "")
+        base_url = self.config.get("search_llm_url", "")
+        model = self.config.get("search_llm_model", "")
+
+        if not api_key or not base_url or not model:
+            logger.debug("[GameSub] 未配置完整的独立 LLM 参数，跳过")
+            return ""
+
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        try:
+            async with aiohttp.ClientSession() as session:
+                payload = {
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "你是一个游戏信息助手，负责根据搜索结果提取游戏的发售日期或版本更新信息。请严格按照要求的格式返回。",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.1,
+                }
+                async with session.post(
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=60),
+                ) as resp:
+                    if resp.status != 200:
+                        err_text = await resp.text()
+                        logger.warning(
+                            f"[GameSub] 搜索 LLM 请求失败: HTTP {resp.status} - {err_text[:200]}"
+                        )
+                        return ""
+                    data = await resp.json()
+
+            text = data["choices"][0]["message"]["content"]
+            return text.strip()
+        except Exception as exc:
+            logger.warning(f"[GameSub] 搜索 LLM 生成异常: {exc}")
+            return ""
+
     async def _batch_search_release(self, game_names: list, umo: str = None,
                                     event: AstrMessageEvent = None) -> dict:
         """批量查询游戏预计发售日期
@@ -764,19 +866,29 @@ class GameSubscriptionPlugin(Star):
 
         games_str = "、".join(game_names)
 
-        # 先使用 Web Search 搜索每个游戏的实际发售信息
+        # 第一步：搜索每个游戏的实际发售信息（优先使用 Tavily，兜底用 AstrBot 内置搜索）
         search_results = {}
+        tavily_configured = bool(self.config.get("tavily_api_key", ""))
+
         for name in game_names:
             query = f"{name} 游戏 发售日期 发行日期"
-            result_text = await self._web_search(query, event)
+            result_text = ""
+            if tavily_configured:
+                result_text = await self._tavily_search(query)
+            if not result_text:
+                # 兜底：尝试 AstrBot 内置的 Web Search 工具
+                result_text = await self._web_search(query, event)
             if result_text:
-                search_results[name] = result_text[:500]  # 截取前 500 字符
+                search_results[name] = result_text[:500]
 
+        # 第二步：构建提取 prompt
         prompt_parts = [
             "请根据以下信息，提取游戏的发售日期。",
         ]
         if search_results:
-            prompt_parts.append("\n以下是网络搜索到的相关信息（优先使用这些信息）：")
+            prompt_parts.append(
+                "\n以下是网络搜索到的相关信息（优先使用这些信息）："
+            )
             for name, ctx in search_results.items():
                 prompt_parts.append(f"\n【{name}】\n{ctx}")
         prompt_parts.append(
@@ -792,10 +904,23 @@ class GameSubscriptionPlugin(Star):
         )
         prompt = "".join(prompt_parts)
 
+        # 第三步：调用 LLM 提取结构化数据
+        text = await self._search_llm_generate(prompt)
+        if text:
+            # 独立 LLM 成功
+            logger.info("[GameSub] 使用独立配置的 LLM 提取发售信息成功")
+        else:
+            # 兜底：使用 AstrBot 默认 LLM 提供商
+            logger.info("[GameSub] 使用 AstrBot 默认 LLM 提供商提取发售信息")
+            try:
+                resp = await provider.text_chat(prompt=prompt)
+                text = resp.completion_text.strip()
+            except Exception as exc:
+                logger.error(f"[GameSub] AstrBot LLM 提取发售信息失败: {exc}")
+                return {}
+
+        # 第四步：解析 JSON
         try:
-            resp = await provider.text_chat(prompt=prompt)
-            text = resp.completion_text.strip()
-            # 尝试清理常见的 markdown 代码块包裹
             if text.startswith("```"):
                 text = text.split("\n", 1)[-1] if "\n" in text else text[3:]
             if text.endswith("```"):
@@ -804,7 +929,7 @@ class GameSubscriptionPlugin(Star):
             return json.loads(text)
         except json.JSONDecodeError:
             logger.error(
-                f"[GameSub] LLM 返回的发售信息无法解析为 JSON:\n{resp.completion_text[:500]}"
+                f"[GameSub] LLM 返回的发售信息无法解析为 JSON:\n{text[:500]}"
             )
         except Exception as exc:
             logger.error(f"[GameSub] 批量查询发售日期失败: {exc}")
@@ -824,11 +949,17 @@ class GameSubscriptionPlugin(Star):
 
         games_str = "、".join(game_names)
 
-        # 先使用 Web Search 搜索每个游戏的更新信息
+        # 第一步：搜索（优先 Tavily，兜底 AstrBot 内置搜索）
         search_results = {}
+        tavily_configured = bool(self.config.get("tavily_api_key", ""))
+
         for name in game_names:
             query = f"{name} 游戏 版本更新 最新版本"
-            result_text = await self._web_search(query, event)
+            result_text = ""
+            if tavily_configured:
+                result_text = await self._tavily_search(query)
+            if not result_text:
+                result_text = await self._web_search(query, event)
             if result_text:
                 search_results[name] = result_text[:500]
 
@@ -851,9 +982,21 @@ class GameSubscriptionPlugin(Star):
         )
         prompt = "".join(prompt_parts)
 
+        # 第二步：调用 LLM 提取（优先独立 LLM）
+        text = await self._search_llm_generate(prompt)
+        if text:
+            logger.info("[GameSub] 使用独立配置的 LLM 提取更新信息成功")
+        else:
+            logger.info("[GameSub] 使用 AstrBot 默认 LLM 提供商提取更新信息")
+            try:
+                resp = await provider.text_chat(prompt=prompt)
+                text = resp.completion_text.strip()
+            except Exception as exc:
+                logger.error(f"[GameSub] AstrBot LLM 提取更新信息失败: {exc}")
+                return {}
+
+        # 第三步：解析 JSON
         try:
-            resp = await provider.text_chat(prompt=prompt)
-            text = resp.completion_text.strip()
             if text.startswith("```"):
                 text = text.split("\n", 1)[-1] if "\n" in text else text[3:]
             if text.endswith("```"):
@@ -862,7 +1005,7 @@ class GameSubscriptionPlugin(Star):
             return json.loads(text)
         except json.JSONDecodeError:
             logger.error(
-                f"[GameSub] LLM 返回的更新信息无法解析为 JSON:\n{resp.completion_text[:500]}"
+                f"[GameSub] LLM 返回的更新信息无法解析为 JSON:\n{text[:500]}"
             )
         except Exception as exc:
             logger.error(f"[GameSub] 批量查询更新日期失败: {exc}")
