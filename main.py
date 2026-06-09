@@ -268,6 +268,17 @@ class GameSubscriptionPlugin(Star):
 
         umo = event.unified_msg_origin
 
+        # 测试模式：带延时，不加入订阅列表，直接执行检索
+        if delay > 0:
+            yield event.plain_result(
+                f"🧪 测试模式：正在检索《{game_name}》...\n"
+                f"⏱️ 将在 {delay} 秒后输出结果"
+            )
+            asyncio.create_task(
+                self._delayed_test(game_name, "release", umo, user_id, delay)
+            )
+            return
+
         # 防重复订阅
         if self._is_user_subscribed_release(game_name, user_id, group_id):
             yield event.plain_result(
@@ -281,21 +292,11 @@ class GameSubscriptionPlugin(Star):
             f"[GameSub] 用户 {user_id} 在群 {group_id} 订阅了游戏发售: {game_name}"
         )
 
-        # 测试模式：带延时
-        if delay > 0:
-            yield event.plain_result(
-                f"✅ 已订阅《{game_name}》发售提醒（测试模式）\n"
-                f"⏱️ 将在 {delay} 秒后执行检索并输出结果..."
-            )
-            asyncio.create_task(
-                self._delayed_test(game_name, "release", umo, user_id, delay)
-            )
-        else:
-            yield event.plain_result(
-                f"✅ 已订阅《{game_name}》的发售提醒！\n"
-                f"📅 将在发售前 {', '.join(str(d) for d in self.reminder_days if d > 0)} 天"
-                f"及发售当天提醒您"
-            )
+        yield event.plain_result(
+            f"✅ 已订阅《{game_name}》的发售提醒！\n"
+            f"📅 将在发售前 {', '.join(str(d) for d in self.reminder_days if d > 0)} 天"
+            f"及发售当天提醒您"
+        )
 
     # ------------------------------------------------------------------
     # /订阅更新 <游戏名>
