@@ -7,8 +7,8 @@
 指令:
     /订阅发售 <游戏名> [延时]    - 订阅游戏发售日期提醒（可选延时秒数测试）
     /订阅更新 <游戏名> [延时]    - 订阅游戏版本更新提醒（可选延时秒数测试）
-    /游戏订阅列表                - 查看当前群的所有订阅
-    /移除订阅 <游戏名>           - 移除指定游戏的所有订阅
+    /游戏订阅列表                - 查看自己的订阅
+    /移除订阅 <游戏名>           - 取消自己对某游戏的订阅
 """
 
 import asyncio
@@ -51,9 +51,6 @@ SUBSCRIPTION_LIST_HTML = """
                  background: #f0f4ff; border-radius: 6px;
                  border-left: 3px solid #4361ee; font-size: 14px;">
         <strong>{{ game.game_name }}</strong>
-        <span style="color: #888; font-size: 12px; margin-left: 6px;">
-          ({{ game.count }}人订阅)
-        </span>
       </li>
       {% endfor %}
     </ul>
@@ -74,9 +71,6 @@ SUBSCRIPTION_LIST_HTML = """
                  background: #fff0f6; border-radius: 6px;
                  border-left: 3px solid #f72585; font-size: 14px;">
         <strong>{{ game.game_name }}</strong>
-        <span style="color: #888; font-size: 12px; margin-left: 6px;">
-          ({{ game.count }}人订阅)
-        </span>
       </li>
       {% endfor %}
     </ul>
@@ -205,6 +199,23 @@ class GameSubscriptionPlugin(Star):
         except (ValueError, AttributeError):
             return [0, 1, 3, 7]
 
+    @staticmethod
+    def _parse_admin_sids(value: str) -> set:
+        """解析 admin_sids 配置，返回 QQ 号集合"""
+        if not value:
+            return set()
+        try:
+            return {sid.strip() for sid in str(value).split(",") if sid.strip()}
+        except Exception:
+            return set()
+
+    def _is_admin(self, user_id: str) -> bool:
+        """检查用户是否为配置的管理员"""
+        sids = self._parse_admin_sids(self.config.get("admin_sids", ""))
+        if not sids:
+            return True  # 未配置管理员则所有人都可以
+        return user_id in sids
+
     # ------------------------------------------------------------------
     # Playwright 浏览器生命周期
     # ------------------------------------------------------------------
@@ -323,17 +334,17 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
         """获取某游戏的所有更新订阅列表"""
         return self.subscriptions["update_subscriptions"].get(game_name, [])
 
-    def _is_user_subscribed_release(self, game_name: str, user_id: str, group_id: str) -> bool:
+    def _is_user_subscribed_release(self, game_name: str, user_id: str) -> bool:
         """检查用户是否已订阅某游戏的发售提醒"""
         return any(
-            sub["user_id"] == user_id and sub["group_id"] == group_id
+            sub["user_id"] == user_id
             for sub in self._get_release_subs(game_name)
         )
 
-    def _is_user_subscribed_update(self, game_name: str, user_id: str, group_id: str) -> bool:
+    def _is_user_subscribed_update(self, game_name: str, user_id: str) -> bool:
         """检查用户是否已订阅某游戏的更新提醒"""
         return any(
-            sub["user_id"] == user_id and sub["group_id"] == group_id
+            sub["user_id"] == user_id
             for sub in self._get_update_subs(game_name)
         )
 
@@ -421,17 +432,21 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
 
         # 测试模式：带延时，不加入订阅列表，直接执行检索
         if delay > 0:
-            yield event.plain_result(
-                f"🧪 测试模式：正在检索《{game_name}》...\n"
-                f"⏱️ 将在 {delay} 秒后输出结果"
-            )
-            asyncio.create_task(
-                self._delayed_test(game_name, "release", umo, user_id, delay, event)
-            )
-            return
+            if not self._is_admin(user_id):
+                # 非管理员不做测试，降级为普通订阅
+                delay = 0
+            else:
+                yield event.plain_result(
+                    f"🧪 测试模式：正在检索《{game_name}》...\n"
+                    f"⏱️ 将在 {delay} 秒后输出结果"
+                )
+                asyncio.create_task(
+                    self._delayed_test(game_name, "release", umo, user_id, delay, event)
+                )
+                return
 
         # 防重复订阅
-        if self._is_user_subscribed_release(game_name, user_id, group_id):
+        if self._is_user_subscribed_release(game_name, user_id):
             yield event.plain_result(
                 f"⚠️ 你已经在本群订阅了《{game_name}》的发售提醒"
             )
@@ -467,17 +482,21 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
 
         # 测试模式：带延时，不加入订阅列表，直接执行检索
         if delay > 0:
-            yield event.plain_result(
-                f"🧪 测试模式：正在检索《{game_name}》...\n"
-                f"⏱️ 将在 {delay} 秒后输出结果"
-            )
-            asyncio.create_task(
-                self._delayed_test(game_name, "update", umo, user_id, delay, event)
-            )
-            return
+            if not self._is_admin(user_id):
+                # 非管理员不做测试，降级为普通订阅
+                delay = 0
+            else:
+                yield event.plain_result(
+                    f"🧪 测试模式：正在检索《{game_name}》...\n"
+                    f"⏱️ 将在 {delay} 秒后输出结果"
+                )
+                asyncio.create_task(
+                    self._delayed_test(game_name, "update", umo, user_id, delay, event)
+                )
+                return
 
         # 防重复订阅
-        if self._is_user_subscribed_update(game_name, user_id, group_id):
+        if self._is_user_subscribed_update(game_name, user_id):
             yield event.plain_result(
                 f"⚠️ 你已经在本群订阅了《{game_name}》的更新提醒"
             )
@@ -497,33 +516,34 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
     # ------------------------------------------------------------------
     @filter.command("游戏订阅列表")
     async def list_subscriptions(self, event: AstrMessageEvent):
-        """查看当前群的游戏订阅列表（按发售/更新分类）"""
+        """查看自己的游戏订阅列表（按发售/更新分类）"""
+        user_id = event.get_sender_id()
         group_id = event.get_group_id()
         if not group_id:
             yield event.plain_result("⚠️ 请在QQ群内使用此指令")
             return
 
-        # 收集本群的发售订阅
+        # 收集自己的发售订阅
         release_subs = []
         for game_name, subs in self.subscriptions["release_subscriptions"].items():
-            group_subs = [s for s in subs if s["group_id"] == group_id]
-            if group_subs:
+            user_subs = [s for s in subs if s["user_id"] == user_id]
+            if user_subs:
                 release_subs.append(
-                    {"game_name": game_name, "count": len(group_subs)}
+                    {"game_name": game_name}
                 )
 
-        # 收集本群的更新订阅
+        # 收集自己的更新订阅
         update_subs = []
         for game_name, subs in self.subscriptions["update_subscriptions"].items():
-            group_subs = [s for s in subs if s["group_id"] == group_id]
-            if group_subs:
+            user_subs = [s for s in subs if s["user_id"] == user_id]
+            if user_subs:
                 update_subs.append(
-                    {"game_name": game_name, "count": len(group_subs)}
+                    {"game_name": game_name}
                 )
 
         if not release_subs and not update_subs:
             yield event.plain_result(
-                "📋 当前群暂无任何游戏订阅\n"
+                "📋 你还没有订阅任何游戏\n"
                 "使用 /订阅发售 游戏名 来订阅游戏发售提醒\n"
                 "使用 /订阅更新 游戏名 来订阅游戏更新提醒"
             )
@@ -542,17 +562,17 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
             yield event.image_result(img_path)
         except Exception as exc:
             logger.warning(f"[GameSub] 图片渲染失败，降级为纯文本: {exc}")
-            lines = ["📋 游戏订阅列表\n"]
+            lines = ["📋 我的游戏订阅\n"]
             lines.append("🕹️ === 游戏发售订阅 ===")
             if release_subs:
                 for g in release_subs:
-                    lines.append(f"  · {g['game_name']}（{g['count']}人订阅）")
+                    lines.append(f"  · {g['game_name']}")
             else:
                 lines.append("  暂无")
             lines.append("\n🔄 === 游戏更新订阅 ===")
             if update_subs:
                 for g in update_subs:
-                    lines.append(f"  · {g['game_name']}（{g['count']}人订阅）")
+                    lines.append(f"  · {g['game_name']}")
             else:
                 lines.append("  暂无")
             yield event.plain_result("\n".join(lines))
@@ -562,35 +582,35 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
     # ------------------------------------------------------------------
     @filter.command("移除订阅")
     async def remove_subscription(self, event: AstrMessageEvent, game_name: str):
-        """移除特定游戏的所有订阅（发售+更新）"""
+        """取消自己对特定游戏的订阅（发售+更新）"""
+        user_id = event.get_sender_id()
         group_id = event.get_group_id()
         if not group_id:
             yield event.plain_result("⚠️ 请在QQ群内使用此指令")
             return
 
-        # 只移除本群的订阅
         removed_count = 0
 
-        # 移除本群的发售订阅
+        # 移除自己的发售订阅
         if game_name in self.subscriptions["release_subscriptions"]:
             before = len(self.subscriptions["release_subscriptions"][game_name])
             self.subscriptions["release_subscriptions"][game_name] = [
                 s
                 for s in self.subscriptions["release_subscriptions"][game_name]
-                if s["group_id"] != group_id
+                if s["user_id"] != user_id
             ]
             after = len(self.subscriptions["release_subscriptions"][game_name])
             removed_count += before - after
             if after == 0:
                 del self.subscriptions["release_subscriptions"][game_name]
 
-        # 移除本群的更新订阅
+        # 移除自己的更新订阅
         if game_name in self.subscriptions["update_subscriptions"]:
             before = len(self.subscriptions["update_subscriptions"][game_name])
             self.subscriptions["update_subscriptions"][game_name] = [
                 s
                 for s in self.subscriptions["update_subscriptions"][game_name]
-                if s["group_id"] != group_id
+                if s["user_id"] != user_id
             ]
             after = len(self.subscriptions["update_subscriptions"][game_name])
             removed_count += before - after
@@ -600,13 +620,13 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
         if removed_count > 0:
             self._save_data()
             logger.info(
-                f"[GameSub] 群 {group_id} 移除了 {removed_count} 条《{game_name}》订阅"
+                f"[GameSub] 用户 {user_id} 取消了对《{game_name}》的订阅"
             )
             yield event.plain_result(
-                f"✅ 已移除本群对《{game_name}》的所有订阅（共 {removed_count} 条）"
+                f"✅ 已取消对《{game_name}》的订阅（共 {removed_count} 条）"
             )
         else:
-            yield event.plain_result(f"⚠️ 本群没有对《{game_name}》的任何订阅")
+            yield event.plain_result(f"⚠️ 你没有订阅《{game_name}》")
 
     # ==================================================================
     # 图片渲染辅助

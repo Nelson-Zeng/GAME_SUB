@@ -52,5 +52,11 @@
         "type": "string",
         "default": "",
         "hint": "当未配置独立 LLM 时，使用此提供商；留空则使用当前会话默认的 LLM 提供商"
+    },
+    "admin_sids": {
+        "description": "管理员 QQ 号列表（逗号分隔），仅管理员可使用测试模式",
+        "type": "string",
+        "default": "",
+        "hint": "多个 QQ 号用逗号分隔，如 12345678,87654321。留空则所有人都可使用测试模式"
     }
 }
