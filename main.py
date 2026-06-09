@@ -275,7 +275,7 @@ class GameSubscriptionPlugin(Star):
                 f"⏱️ 将在 {delay} 秒后输出结果"
             )
             asyncio.create_task(
-                self._delayed_test(game_name, "release", umo, user_id, delay)
+                self._delayed_test(game_name, "release", umo, user_id, delay, event)
             )
             return
 
@@ -452,6 +452,7 @@ class GameSubscriptionPlugin(Star):
         umo: str,
         user_id: str,
         delay: int,
+        event: AstrMessageEvent = None,
     ):
         """延时后执行一次检索并输出结果（用于测试）"""
         await asyncio.sleep(delay)
@@ -460,7 +461,7 @@ class GameSubscriptionPlugin(Star):
             today_str = today.strftime("%Y-%m-%d")
 
             if sub_type == "release":
-                result = await self._batch_search_release([game_name], umo)
+                result = await self._batch_search_release([game_name], umo, event)
                 if game_name in result:
                     info = result[game_name]
                     release_date_str = info.get("release_date", "未知")
@@ -492,7 +493,7 @@ class GameSubscriptionPlugin(Star):
                         f"❌ 未能获取到该游戏的发售日期信息"
                     )
             else:
-                result = await self._batch_search_update([game_name], umo)
+                result = await self._batch_search_update([game_name], umo, event)
                 if game_name in result:
                     info = result[game_name]
                     update_date_str = info.get("update_date", "未知")
@@ -638,7 +639,47 @@ class GameSubscriptionPlugin(Star):
             return all_providers[0]
         return None
 
-    async def _batch_search_release(self, game_names: list, umo: str = None) -> dict:
+    async def _web_search(self, query: str, event: AstrMessageEvent = None) -> str:
+        """使用 AstrBot 内置的 Web Search 工具搜索信息
+
+        通过 LLM Tool Manager 获取已注册的 web_search 工具并调用。
+        """
+        try:
+            tool_mgr = self.context.get_llm_tool_manager()
+            if not tool_mgr:
+                return ""
+
+            # 尝试多种可能的搜索工具名称
+            search_tool = None
+            for name in ["web_search_tavily", "web_search", "search_internet", "web_search_tool"]:
+                search_tool = tool_mgr.get_func(name)
+                if search_tool:
+                    logger.info(f"[GameSub] 使用搜索工具: {name}")
+                    break
+
+            if not search_tool:
+                logger.debug("[GameSub] 未找到可用的 Web Search 工具")
+                return ""
+
+            result = await search_tool.run(event, query=query)
+
+            # 处理不同类型的返回值
+            if result is None:
+                return ""
+            if hasattr(result, 'content'):
+                content = result.content
+                if isinstance(content, list):
+                    return "\n".join(
+                        str(c.text) for c in content if hasattr(c, 'text')
+                    )
+                return str(content)
+            return str(result)
+        except Exception as exc:
+            logger.warning(f"[GameSub] Web Search 查询失败 [{query}]: {exc}")
+            return ""
+
+    async def _batch_search_release(self, game_names: list, umo: str = None,
+                                    event: AstrMessageEvent = None) -> dict:
         """批量查询游戏预计发售日期
 
         将所有游戏合并为一次 LLM 请求，减少 API 调用次数。
@@ -652,17 +693,34 @@ class GameSubscriptionPlugin(Star):
             return {}
 
         games_str = "、".join(game_names)
-        prompt = (
-            "请帮我查询以下游戏的预计发售日期（或实际发售日期）。\n\n"
-            f"游戏列表：{games_str}\n\n"
-            "要求：\n"
-            "1. 请仅返回纯 JSON 格式数据，不要包含任何其他文字、代码块标记。\n"
-            "2. 日期统一使用 YYYY-MM-DD 格式；如果只有年月则用该月最后一天代替。\n"
-            '3. status 可以是 "已发售"、"未发售"、"未知"。\n'
-            "4. 如果查不到某个游戏，release_date 填 \"未知\"。\n\n"
-            "返回格式示例：\n"
-            '{"游戏名": {"release_date": "2025-06-15", "status": "未发售"}}'
+
+        # 先使用 Web Search 搜索每个游戏的实际发售信息
+        search_results = {}
+        for name in game_names:
+            query = f"{name} 游戏 发售日期 发行日期"
+            result_text = await self._web_search(query, event)
+            if result_text:
+                search_results[name] = result_text[:500]  # 截取前 500 字符
+
+        prompt_parts = [
+            "请根据以下信息，提取游戏的发售日期。",
+        ]
+        if search_results:
+            prompt_parts.append("\n以下是网络搜索到的相关信息（优先使用这些信息）：")
+            for name, ctx in search_results.items():
+                prompt_parts.append(f"\n【{name}】\n{ctx}")
+        prompt_parts.append(
+            f"\n\n请从以上信息中提取以下游戏的预计发售日期（或实际发售日期）。"
+            f"\n游戏列表：{games_str}"
+            f"\n要求："
+            f"\n1. 请仅返回纯 JSON 格式数据，不要包含任何其他文字、代码块标记。"
+            f"\n2. 日期统一使用 YYYY-MM-DD 格式；如果只有年月则用该月最后一天代替。"
+            f"\n3. status 可以是 \"已发售\"、\"未发售\"、\"未知\"。"
+            f"\n4. 如果查不到某个游戏，release_date 填 \"未知\"。"
+            f"\n\n返回格式示例："
+            f'\n{{"游戏名": {{"release_date": "2025-06-15", "status": "未发售"}}}}'
         )
+        prompt = "".join(prompt_parts)
 
         try:
             resp = await provider.text_chat(prompt=prompt)
@@ -682,7 +740,8 @@ class GameSubscriptionPlugin(Star):
             logger.error(f"[GameSub] 批量查询发售日期失败: {exc}")
         return {}
 
-    async def _batch_search_update(self, game_names: list, umo: str = None) -> dict:
+    async def _batch_search_update(self, game_names: list, umo: str = None,
+                                     event: AstrMessageEvent = None) -> dict:
         """批量查询游戏最近版本更新日期
 
         Returns:
@@ -694,16 +753,33 @@ class GameSubscriptionPlugin(Star):
             return {}
 
         games_str = "、".join(game_names)
-        prompt = (
-            "请帮我查询以下游戏的最近一次版本更新日期和版本号。\n\n"
-            f"游戏列表：{games_str}\n\n"
-            "要求：\n"
-            "1. 请仅返回纯 JSON 格式数据，不要包含任何其他文字、代码块标记。\n"
-            "2. 日期使用 YYYY-MM-DD 格式。\n"
-            "3. 如果查不到，update_date 填 \"未知\"。\n\n"
-            "返回格式示例：\n"
-            '{"游戏名": {"update_date": "2025-06-01", "version": "v1.5.0"}}'
+
+        # 先使用 Web Search 搜索每个游戏的更新信息
+        search_results = {}
+        for name in game_names:
+            query = f"{name} 游戏 版本更新 最新版本"
+            result_text = await self._web_search(query, event)
+            if result_text:
+                search_results[name] = result_text[:500]
+
+        prompt_parts = [
+            "请根据以下信息，提取游戏的最近版本更新日期和版本号。",
+        ]
+        if search_results:
+            prompt_parts.append("\n以下是网络搜索到的相关信息（优先使用这些信息）：")
+            for name, ctx in search_results.items():
+                prompt_parts.append(f"\n【{name}】\n{ctx}")
+        prompt_parts.append(
+            f"\n\n请从以上信息中提取以下游戏的最近一次版本更新日期和版本号。"
+            f"\n游戏列表：{games_str}"
+            f"\n要求："
+            f"\n1. 请仅返回纯 JSON 格式数据，不要包含任何其他文字、代码块标记。"
+            f"\n2. 日期使用 YYYY-MM-DD 格式。"
+            f"\n3. 如果查不到，update_date 填 \"未知\"。"
+            f"\n\n返回格式示例："
+            f'\n{{"游戏名": {{"update_date": "2025-06-01", "version": "v1.5.0"}}}}'
         )
+        prompt = "".join(prompt_parts)
 
         try:
             resp = await provider.text_chat(prompt=prompt)
