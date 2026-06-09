@@ -1,0 +1,9 @@
+name: astrbot_plugin_game_subscription
+display_name: 游戏订阅提醒
+desc: QQ群游戏发售与更新订阅提醒插件，支持订阅游戏发售日期和版本更新，在指定时间自动检索并@提醒用户
+version: 1.0.0
+author: GameSubPlugin
+repo: ""
+short_desc: 游戏发售/更新订阅提醒
+support_platforms:
+  - aiocqhttp

@@ -1,0 +1,32 @@
+{
+    "check_time": {
+        "description": "每日自动检索与提醒的执行时间",
+        "type": "object",
+        "items": {
+            "hour": {
+                "description": "执行小时（24小时制，0-23）",
+                "type": "int",
+                "default": 9,
+                "hint": "每天在此时间执行游戏发售日期和更新日期的检索"
+            },
+            "minute": {
+                "description": "执行分钟（0-59）",
+                "type": "int",
+                "default": 0,
+                "hint": "配合小时使用，精确到分钟"
+            }
+        }
+    },
+    "reminder_days": {
+        "description": "发售前提醒天数（逗号分隔的整数）",
+        "type": "string",
+        "default": "7,3,1,0",
+        "hint": "在游戏发售前这些天数时发送提醒，0表示发售当天"
+    },
+    "search_provider_id": {
+        "description": "搜索用LLM提供商ID（可选）",
+        "type": "string",
+        "default": "",
+        "hint": "留空则使用当前会话默认的LLM提供商进行游戏信息检索"
+    }
+}
