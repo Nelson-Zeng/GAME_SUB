@@ -663,6 +663,13 @@ class GameSubscriptionPlugin(Star):
 
             # 兼容不同的工具调用接口：遍历所有可能的调用方法名，对每个方法尝试多种调用风格
             logger.info(f"[GameSub] 使用搜索工具: {type(search_tool).__name__}")
+            # 打印工具的所有可调用方法，方便排查
+            tool_methods = [
+                m for m in dir(search_tool)
+                if not m.startswith('_') and callable(getattr(search_tool, m))
+            ]
+            logger.debug(f"[GameSub] 搜索工具的可调用方法: {tool_methods}")
+
             result = None
 
             for method_name in ['run', 'call', 'execute', 'invoke', 'search', 'query']:
@@ -673,37 +680,40 @@ class GameSubscriptionPlugin(Star):
                 if result is None:
                     try:
                         result = await method(query=query)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"[GameSub] 方法 {method_name}(query=query) 失败: {e}")
                 if result is None and event:
                     try:
                         result = await method(event, query=query)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"[GameSub] 方法 {method_name}(event, query=query) 失败: {e}")
                 if result is None:
                     try:
                         result = await method({'query': query})
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"[GameSub] 方法 {method_name}({{\'query\': query}}) 失败: {e}")
                 if result is not None:
                     logger.info(f"[GameSub] 搜索工具调用成功 (方法: {method_name})")
                     break
 
             # 如果上面的遍历都失败了，尝试直接作为 callable 调用
             if result is None and callable(search_tool):
-                for try_call in [
-                    lambda: search_tool(query=query),
-                    lambda: search_tool(event, query=query) if event else None,
-                    lambda: search_tool({'query': query}),
+                logger.debug(f"[GameSub] 尝试直接 callable 调用")
+                for desc, call_args in [
+                    ("search_tool(query=query)", lambda: search_tool(query=query)),
+                    ("search_tool(event, query)", lambda: search_tool(event, query=query) if event else None),
+                    ("search_tool({{'query': query}})", lambda: search_tool({'query': query})),
                 ]:
                     try:
-                        r = try_call()
+                        r = call_args()
                         if asyncio.iscoroutine(r):
                             r = await r
                         if r is not None:
+                            logger.info(f"[GameSub] callable 调用成功: {desc}")
                             result = r
                             break
-                    except Exception:
+                    except Exception as e:
+                        logger.debug(f"[GameSub] callable {desc} 失败: {e}")
                         continue
 
             if result is None:
