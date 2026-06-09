@@ -813,20 +813,30 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
             self.subscriptions["release_subscriptions"].keys()
         )
         if release_game_names:
+            # 1a. 游戏名去重
+            release_dedup = await self._deduplicate_game_names(release_game_names)
+            canonical_names = list(release_dedup.keys())
             logger.info(
-                f"[GameSub] 批量检索 {len(release_game_names)} 个游戏的发售日期"
+                f"[GameSub] 发售订阅: {len(release_game_names)} 个名称 → "
+                f"{len(canonical_names)} 个标准名"
             )
-            release_info = await self._batch_search_release(release_game_names)
 
-            # 构建提醒列表 & 记录 last_reminder
+            # 1b. 批量检索（仅用标准名）
+            release_info = await self._batch_search_release(canonical_names)
+
+            # 1c. 将标准名的结果扩回到所有别名
+            expanded_info = {}
+            for canonical, aliases in release_dedup.items():
+                if canonical in release_info:
+                    for alias in aliases:
+                        expanded_info[alias] = release_info[canonical]
+            release_info = expanded_info
+
+            # 1d. 构建提醒 & 发送
             release_reminders = self._build_release_reminders(
                 release_info, today
             )
-
-            # 发送提醒通知
             await self._send_release_notifications(release_reminders)
-
-            # 发售当天及之后自动清理
             self._auto_cleanup_release(release_reminders, today)
 
         # ---- 2. 处理更新订阅 ----
@@ -834,11 +844,26 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
             self.subscriptions["update_subscriptions"].keys()
         )
         if update_game_names:
+            # 2a. 游戏名去重
+            update_dedup = await self._deduplicate_game_names(update_game_names)
+            canonical_names = list(update_dedup.keys())
             logger.info(
-                f"[GameSub] 批量检索 {len(update_game_names)} 个游戏的更新日期"
+                f"[GameSub] 更新订阅: {len(update_game_names)} 个名称 → "
+                f"{len(canonical_names)} 个标准名"
             )
-            update_info = await self._batch_search_update(update_game_names)
 
+            # 2b. 批量检索（仅用标准名）
+            update_info = await self._batch_search_update(canonical_names)
+
+            # 2c. 将标准名的结果扩回到所有别名
+            expanded_info = {}
+            for canonical, aliases in update_dedup.items():
+                if canonical in update_info:
+                    for alias in aliases:
+                        expanded_info[alias] = update_info[canonical]
+            update_info = expanded_info
+
+            # 2d. 构建提醒 & 发送
             update_reminders = self._build_update_reminders(
                 update_info, today_str
             )
@@ -866,6 +891,90 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
         if all_providers:
             return all_providers[0]
         return None
+
+    async def _call_llm(self, prompt: str) -> str:
+        """通用 LLM 调用：优先独立 LLM，兜底默认提供商"""
+        text = await self._search_llm_generate(prompt)
+        if text:
+            return text
+        provider = await self._get_provider()
+        if not provider:
+            return ""
+        try:
+            resp = await provider.text_chat(prompt=prompt)
+            return resp.completion_text.strip()
+        except Exception as exc:
+            logger.warning(f"[GameSub] LLM 调用失败: {exc}")
+            return ""
+
+    async def _deduplicate_game_names(self, game_names: list) -> dict:
+        """对游戏名称列表进行智能去重
+
+        通过 LLM 识别指向同一游戏的不同名称/翻译/缩写，
+        返回 {标准名: [原始名1, 原始名2, ...]} 的映射。
+        """
+        if len(game_names) <= 1:
+            return {n: [n] for n in game_names}
+
+        names_str = "、".join(game_names)
+        prompt = (
+            f"你是一个游戏名称规范化助手。以下是一个游戏名称列表，"
+            f"请将其中指向同一游戏的不同名称、翻译、缩写归为一组。\n\n"
+            f"规则：\n"
+            f"1. 只合并确定指向同一游戏的名称，不确定时保持独立。\n"
+            f"2. 每组选择一个最完整、最正式的名称作为标准名(canonical)。\n"
+            f"3. 名称完全一致时也作为一组。\n"
+            f"4. 仅返回纯 JSON，不要代码块标记或额外文字。\n\n"
+            f"返回格式：\n"
+            f'{{"groups": [{{"canonical": "标准名", "aliases": ["名称1", "名称2"]}}]}}\n\n'
+            f"游戏列表：{names_str}"
+        )
+
+        text = await self._call_llm(prompt)
+        if not text:
+            logger.warning("[GameSub] 游戏去重 LLM 返回为空，跳过去重")
+            return {n: [n] for n in game_names}
+
+        # 清理可能的代码块标记
+        if text.startswith("```"):
+            text = text.split("\n", 1)[-1] if "\n" in text else text[3:]
+        if text.endswith("```"):
+            text = text[:-3]
+        text = text.strip()
+
+        try:
+            data = json.loads(text)
+            groups = data.get("groups", [])
+            if not groups:
+                return {n: [n] for n in game_names}
+
+            # 验证所有原始名称都被覆盖
+            mapped = {}  # canonical → [aliases]
+            all_mapped_names = set()
+            for group in groups:
+                canonical = group.get("canonical", "")
+                aliases = group.get("aliases", [])
+                if not canonical:
+                    continue
+                # 确保 canonical 也在 aliases 中
+                if canonical not in aliases:
+                    aliases.insert(0, canonical)
+                mapped[canonical] = aliases
+                all_mapped_names.update(aliases)
+
+            # 未被 LLM 覆盖到的名称单独成组
+            for name in game_names:
+                if name not in all_mapped_names:
+                    mapped[name] = [name]
+
+            logger.info(
+                f"[GameSub] 游戏去重: {len(game_names)} 个名称 → "
+                f"{len(mapped)} 个标准名"
+            )
+            return mapped
+        except (json.JSONDecodeError, Exception) as exc:
+            logger.warning(f"[GameSub] 解析去重结果失败: {exc}")
+            return {n: [n] for n in game_names}
 
     async def _web_search(self, query: str, event: AstrMessageEvent = None) -> str:
         """使用 AstrBot 内置的 Web Search 工具搜索信息
