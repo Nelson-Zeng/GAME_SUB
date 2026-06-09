@@ -661,20 +661,67 @@ class GameSubscriptionPlugin(Star):
                 logger.debug("[GameSub] 未找到可用的 Web Search 工具")
                 return ""
 
-            # 兼容不同的工具调用接口
+            # 兼容不同的工具调用接口：遍历所有可能的调用方法名，对每个方法尝试多种调用风格
             logger.info(f"[GameSub] 使用搜索工具: {type(search_tool).__name__}")
             result = None
 
-            if hasattr(search_tool, 'run'):
-                result = await search_tool.run(event, query=query)
-            elif hasattr(search_tool, 'call'):
-                # MCP 工具风格，接收参数字典
-                try:
-                    result = await search_tool.call({"query": query})
-                except Exception:
-                    result = await search_tool.call(event, query=query)
-            elif callable(search_tool):
-                result = await search_tool(event, query=query)
+            for method_name in ['run', 'call', 'execute', 'invoke', 'search', 'query']:
+                method = getattr(search_tool, method_name, None)
+                if not method or not callable(method):
+                    continue
+
+                if result is None:
+                    try:
+                        result = await method(query=query)
+                    except Exception:
+                        pass
+                if result is None and event:
+                    try:
+                        result = await method(event, query=query)
+                    except Exception:
+                        pass
+                if result is None:
+                    try:
+                        result = await method({'query': query})
+                    except Exception:
+                        pass
+                if result is not None:
+                    logger.info(f"[GameSub] 搜索工具调用成功 (方法: {method_name})")
+                    break
+
+            # 如果上面的遍历都失败了，尝试直接作为 callable 调用
+            if result is None and callable(search_tool):
+                for try_call in [
+                    lambda: search_tool(query=query),
+                    lambda: search_tool(event, query=query) if event else None,
+                    lambda: search_tool({'query': query}),
+                ]:
+                    try:
+                        r = try_call()
+                        if asyncio.iscoroutine(r):
+                            r = await r
+                        if r is not None:
+                            result = r
+                            break
+                    except Exception:
+                        continue
+
+            if result is None:
+                # 最后的兜底：将工具加入 func_tool 让 LLM 调用
+                logger.info(f"[GameSub] 直接调用失败，尝试通过 LLM 调用搜索工具")
+                from astrbot.core.agent.tool import ToolSet
+                provider = await self._get_provider(event.unified_msg_origin if event else None)
+                if provider:
+                    ts = ToolSet()
+                    ts.add_tool(search_tool)
+                    try:
+                        llm_resp = await provider.text_chat(
+                            prompt=f"请搜索：{query}",
+                            func_tool=ts,
+                        )
+                        result = llm_resp.completion_text if llm_resp else None
+                    except Exception:
+                        pass
 
             # 处理不同类型的返回值
             if result is None:
