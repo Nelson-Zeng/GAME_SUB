@@ -18,7 +18,7 @@ import os
 from datetime import datetime, timedelta
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star
 import astrbot.api.message_components as Comp
 
@@ -509,17 +509,19 @@ class GameSubscriptionPlugin(Star):
                         f"❌ 未能获取到该游戏的更新信息"
                     )
 
-            chain = [Comp.At(qq=user_id), Comp.Plain(f" {msg}")]
-            await self.context.send_message(umo, chain)
+            message_chain = MessageChain()
+            message_chain.chain = [Comp.At(qq=user_id), Comp.Plain(f" {msg}")]
+            await self.context.send_message(umo, message_chain)
 
         except Exception as exc:
             logger.error(f"[GameSub] 延时测试执行失败: {exc}")
             try:
-                chain = [
+                message_chain = MessageChain()
+                message_chain.chain = [
                     Comp.At(qq=user_id),
                     Comp.Plain(f" 🧪 测试执行失败: {exc}"),
                 ]
-                await self.context.send_message(umo, chain)
+                await self.context.send_message(umo, message_chain)
             except Exception:
                 pass
 
@@ -821,7 +823,9 @@ class GameSubscriptionPlugin(Star):
 
                 if chain:
                     header = [Comp.Plain("📢 游戏发售提醒\n")]
-                    await self.context.send_message(umo, header + chain)
+                    message_chain = MessageChain()
+                    message_chain.chain = header + chain
+                    await self.context.send_message(umo, message_chain)
                     logger.info(
                         f"[GameSub] 已发送 {len(items)} 条发售提醒到 {umo}"
                     )
@@ -861,7 +865,9 @@ class GameSubscriptionPlugin(Star):
 
                 if chain:
                     header = [Comp.Plain("📢 游戏更新提醒\n")]
-                    await self.context.send_message(umo, header + chain)
+                    message_chain = MessageChain()
+                    message_chain.chain = header + chain
+                    await self.context.send_message(umo, message_chain)
                     logger.info(
                         f"[GameSub] 已发送 {len(items)} 条更新提醒到 {umo}"
                     )
