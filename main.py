@@ -329,7 +329,7 @@ class GameSubscriptionPlugin(Star):
     # ------------------------------------------------------------------
     # /订阅列表
     # ------------------------------------------------------------------
-    @filter.command("订阅列表")
+    @filter.command("游戏订阅列表")
     async def list_subscriptions(self, event: AstrMessageEvent):
         """查看当前群的游戏订阅列表（按发售/更新分类）"""
         group_id = event.get_group_id()
