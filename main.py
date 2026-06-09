@@ -661,7 +661,20 @@ class GameSubscriptionPlugin(Star):
                 logger.debug("[GameSub] 未找到可用的 Web Search 工具")
                 return ""
 
-            result = await search_tool.run(event, query=query)
+            # 兼容不同的工具调用接口
+            logger.info(f"[GameSub] 使用搜索工具: {type(search_tool).__name__}")
+            result = None
+
+            if hasattr(search_tool, 'run'):
+                result = await search_tool.run(event, query=query)
+            elif hasattr(search_tool, 'call'):
+                # MCP 工具风格，接收参数字典
+                try:
+                    result = await search_tool.call({"query": query})
+                except Exception:
+                    result = await search_tool.call(event, query=query)
+            elif callable(search_tool):
+                result = await search_tool(event, query=query)
 
             # 处理不同类型的返回值
             if result is None:
