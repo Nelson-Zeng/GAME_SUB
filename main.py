@@ -154,6 +154,9 @@ class GameSubscriptionPlugin(Star):
     - 每日定时批量检索，一次性查询所有订阅游戏
     """
 
+    _schedule_started = False  # 类级别标志，防止热重载产生多个定时任务
+    _schedule_task = None       # 跟踪当前定时任务，用于热重载时取消旧任务
+
     # ------------------------------------------------------------------
     # 初始化
     # ------------------------------------------------------------------
@@ -183,8 +186,23 @@ class GameSubscriptionPlugin(Star):
             self.config.get("reminder_days", "7,3,1,0")
         )
 
-        # 启动每日定时检查任务
-        asyncio.create_task(self._schedule_loop())
+        # 解析定时配置
+        self._check_hour, self._check_minute = self._parse_check_time(
+            self.config.get("check_time", {})
+        )
+
+        # 记录当日已执行过的日期（用于防重复）
+        self._last_check_date = None
+
+        # 用引用计数确保只启动一个定时任务
+        # 如果已有旧任务（AstrBot 热重载场景），先取消旧任务再创建新的
+        old_task = GameSubscriptionPlugin._schedule_task
+        if old_task is not None and not old_task.done():
+            old_task.cancel()
+            logger.info("[GameSub] 已取消旧的定时任务")
+        GameSubscriptionPlugin._schedule_task = asyncio.create_task(
+            self._schedule_loop()
+        )
 
     # ------------------------------------------------------------------
     # 配置解析
@@ -198,6 +216,20 @@ class GameSubscriptionPlugin(Star):
             return sorted([int(d.strip()) for d in str(value).split(",") if d.strip()])
         except (ValueError, AttributeError):
             return [0, 1, 3, 7]
+
+    @staticmethod
+    def _parse_check_time(check_time: dict) -> tuple:
+        """解析定时检查时间，返回 (hour, minute)，确保在合法范围"""
+        if not isinstance(check_time, dict):
+            return 9, 0
+        try:
+            hour = int(check_time.get("hour", 9))
+            minute = int(check_time.get("minute", 0))
+            hour = max(0, min(23, hour))
+            minute = max(0, min(59, minute))
+            return hour, minute
+        except (ValueError, TypeError):
+            return 9, 0
 
     @staticmethod
     def _parse_admin_sids(value: str) -> set:
@@ -700,11 +732,18 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
                 if game_name in result:
                     info = result[game_name]
                     date_str = info.get("update_date", "未知")
+                    # 版本描述
+                    ver_parts = []
+                    if info.get("version_name"):
+                        ver_parts.append(info["version_name"])
+                    if info.get("version_code"):
+                        ver_parts.append(info["version_code"])
+                    version_str = " · ".join(ver_parts) if ver_parts else ""
                     data.update({
                         "game_name": game_name,
-                        "label": "最近更新日期",
+                        "label": "下个版本更新日期",
                         "date": date_str,
-                        "status": info.get("version", ""),
+                        "status": version_str,
                         "label_text": "更新",
                     })
                     try:
@@ -714,7 +753,7 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
                         pass
                 else:
                     data["game_name"] = game_name
-                    data["msg"] = "❌ 未能获取到该游戏的更新信息"
+                    data["msg"] = "❌ 未能获取到该游戏的版本更新预告信息"
 
             # 优先图片，降级纯文本
             sent = await self._send_image(umo, user_id, TEST_RESULT_HTML, data)
@@ -759,7 +798,7 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
     # 每日定时调度
     # ==================================================================
     async def _schedule_loop(self):
-        """每日定时任务主循环"""
+        """每日定时任务主循环（类级锁确保全局仅一个实例）"""
         # 等待 AstrBot 完全初始化
         await asyncio.sleep(15)
         logger.info("[GameSub] 每日定时检查任务已启动")
@@ -767,16 +806,11 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
         while True:
             try:
                 now = datetime.now()
-                check_hour = int(
-                    self.config.get("check_time", {}).get("hour", 9)
-                )
-                check_minute = int(
-                    self.config.get("check_time", {}).get("minute", 0)
-                )
 
                 # 计算下一个执行时间
                 target = now.replace(
-                    hour=check_hour, minute=check_minute, second=0, microsecond=0
+                    hour=self._check_hour, minute=self._check_minute,
+                    second=0, microsecond=0
                 )
                 if now >= target:
                     target += timedelta(days=1)
@@ -784,18 +818,32 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
                 wait_seconds = (target - now).total_seconds()
                 logger.info(
                     f"[GameSub] 下次每日检查将在 {target.strftime('%Y-%m-%d %H:%M')} 执行"
-                    f"（{wait_seconds:.0f}秒后）"
+                    f"（{wait_seconds:.0f}秒后，hour={self._check_hour}"
+                    f",minute={self._check_minute}）"
                 )
 
                 await asyncio.sleep(wait_seconds)
+
+                # 今日唯一性检查：防止 AstrBot 热重载遗留的旧协程重复触发
+                today_str = datetime.now().strftime("%Y-%m-%d")
+                if getattr(self, "_last_check_date", None) == today_str:
+                    logger.info(
+                        f"[GameSub] 今日 {today_str} 已执行过每日检查，跳过重复触发"
+                    )
+                    await asyncio.sleep(60)
+                    continue
 
                 # 执行每日检查
                 logger.info("[GameSub] 开始执行每日检查...")
                 await self._daily_check()
 
-                # 执行完毕后等待 60 秒，防止同一时间重复触发
+                # 记录当日已执行，防止同一天再次触发
+                self._last_check_date = today_str
                 await asyncio.sleep(60)
 
+            except asyncio.CancelledError:
+                logger.info("[GameSub] 定时任务已被取消，退出循环")
+                break
             except Exception as exc:
                 logger.error(f"[GameSub] 定时任务循环异常: {exc}")
                 await asyncio.sleep(300)  # 异常后等待 5 分钟再重试
@@ -865,7 +913,7 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
 
             # 2d. 构建提醒 & 发送
             update_reminders = self._build_update_reminders(
-                update_info, today_str
+                update_info, today
             )
             await self._send_update_notifications(update_reminders)
 
@@ -1233,7 +1281,7 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
             f"\n1. 请仅返回纯 JSON 格式数据，不要包含任何其他文字、代码块标记。"
             f"\n2. 日期统一使用 YYYY-MM-DD 格式；如果只有年月则用该月最后一天代替。"
             f"\n3. status 可以是 \"已发售\"、\"未发售\"、\"未知\"。"
-            f"\n4. 如果查不到某个游戏，release_date 填 \"未知\"。"
+            f"\n4. ❗重要：不得猜测或推断日期。只有搜索结果中明确提到该游戏的发售日期时才填写，否则 release_date 必须填 \"未知\"。错误地填写一个不存在的日期会导致错误推送，比填\"未知\"更糟糕。"
             f"\n\n返回格式示例："
             f'\n{{"游戏名": {{"release_date": "2025-06-15", "status": "未发售"}}}}'
         )
@@ -1261,7 +1309,20 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
             if text.endswith("```"):
                 text = text[:-3]
             text = text.strip()
-            return json.loads(text)
+            result = json.loads(text)
+            # 验证日期是否出现在搜索结果中，防止 LLM 猜测
+            if search_results:
+                for game_name in list(result.keys()):
+                    if game_name in search_results:
+                        date_val = result[game_name].get("release_date", "")
+                        if date_val and date_val != "未知":
+                            if date_val not in search_results[game_name]:
+                                logger.warning(
+                                    f"[GameSub] 发售日期 {date_val} 未出现在"
+                                    f"《{game_name}》的搜索结果中，标记为未知"
+                                )
+                                result[game_name]["release_date"] = "未知"
+            return result
         except json.JSONDecodeError:
             logger.error(
                 f"[GameSub] LLM 返回的发售信息无法解析为 JSON:\n{text[:500]}"
@@ -1272,10 +1333,10 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
 
     async def _batch_search_update(self, game_names: list, umo: str = None,
                                      event: AstrMessageEvent = None) -> dict:
-        """批量查询游戏最近版本更新日期
+        """批量查询游戏的下一个版本更新预告（尚未发布的未来版本）
 
         Returns:
-            {游戏名: {"update_date": "YYYY-MM-DD", "version": "..."}}
+            {游戏名: {"update_date": "YYYY-MM-DD", "version_name": "...", "version_code": "..."}}
         """
         provider = await self._get_provider(umo)
         if not provider:
@@ -1289,7 +1350,7 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
         tavily_configured = bool(self.config.get("tavily_api_key", ""))
 
         for name in game_names:
-            query = f"{name} 游戏 版本更新 最新版本"
+            query = f"{name} 游戏 下个版本 新版本 前瞻 更新时间 上线时间 更新计划"
             result_text = ""
             if tavily_configured:
                 result_text = await self._tavily_search(query)
@@ -1299,21 +1360,22 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
                 search_results[name] = result_text[:500]
 
         prompt_parts = [
-            "请根据以下信息，提取游戏的最近版本更新日期和版本号。",
+            "请根据以下信息，提取游戏的下一个即将发布的版本信息（尚未发布的未来版本）。",
         ]
         if search_results:
             prompt_parts.append("\n以下是网络搜索到的相关信息（优先使用这些信息）：")
             for name, ctx in search_results.items():
                 prompt_parts.append(f"\n【{name}】\n{ctx}")
         prompt_parts.append(
-            f"\n\n请从以上信息中提取以下游戏的最近一次版本更新日期和版本号。"
+            f"\n\n请从以上信息中提取以下游戏的下一个尚未发布的版本信息（即将到来的下次更新、下个版本预告）。"
             f"\n游戏列表：{games_str}"
             f"\n要求："
             f"\n1. 请仅返回纯 JSON 格式数据，不要包含任何其他文字、代码块标记。"
             f"\n2. 日期使用 YYYY-MM-DD 格式。"
-            f"\n3. 如果查不到，update_date 填 \"未知\"。"
+            f"\n3. ❗重要：只有搜索结果中明确提到下一版本的预计/确定更新日期时才填写 update_date，否则必须填 \"未知\"。禁止猜测日期。"
+            f"\n4. version_name 为下一个版本的版本名称（如原神\"荣花与炎日之途\"、崩铁\"再见，匹诺康尼\"），version_code 为版本号（如 v5.0.0）。尽量同时提供，实在找不到则填空字符串。"
             f"\n\n返回格式示例："
-            f'\n{{"游戏名": {{"update_date": "2025-06-01", "version": "v1.5.0"}}}}'
+            f'\n{{"游戏名": {{"update_date": "2026-07-15", "version_name": "荣花与炎日之途", "version_code": "v5.0.0"}}}}'
         )
         prompt = "".join(prompt_parts)
 
@@ -1337,7 +1399,20 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
             if text.endswith("```"):
                 text = text[:-3]
             text = text.strip()
-            return json.loads(text)
+            result = json.loads(text)
+            # 验证日期是否出现在搜索结果中，防止 LLM 猜测
+            if search_results:
+                for game_name in list(result.keys()):
+                    if game_name in search_results:
+                        date_val = result[game_name].get("update_date", "")
+                        if date_val and date_val != "未知":
+                            if date_val not in search_results[game_name]:
+                                logger.warning(
+                                    f"[GameSub] 更新日期 {date_val} 未出现在"
+                                    f"《{game_name}》的搜索结果中，标记为未知"
+                                )
+                                result[game_name]["update_date"] = "未知"
+            return result
         except json.JSONDecodeError:
             logger.error(
                 f"[GameSub] LLM 返回的更新信息无法解析为 JSON:\n{text[:500]}"
@@ -1393,26 +1468,41 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
                 )
         return reminders
 
-    def _build_update_reminders(self, update_info: dict, today_str: str) -> list:
-        """根据检索结果构建更新提醒列表
+    def _build_update_reminders(self, update_info: dict, today: datetime) -> list:
+        """根据检索结果构建版本更新提醒列表（未来版本预告）
 
         Returns:
-            [{game_name, update_date_str, version, subs}]
+            [{game_name, update_date_str, days_until, version_name, version_code, subs}]
         """
         reminders = []
         for game_name, info in update_info.items():
             update_date_str = info.get("update_date", "未知")
-            if update_date_str == today_str:
-                subs = self.subscriptions["update_subscriptions"].get(game_name, [])
-                if subs:
-                    reminders.append(
-                        {
-                            "game_name": game_name,
-                            "update_date_str": update_date_str,
-                            "version": info.get("version", ""),
-                            "subs": subs,
-                        }
+            if update_date_str == "未知":
+                continue
+
+            try:
+                update_date = datetime.strptime(update_date_str, "%Y-%m-%d").date()
+                days_until = (update_date - today.date()).days
+
+                if days_until in self.reminder_days:
+                    subs = self.subscriptions["update_subscriptions"].get(
+                        game_name, []
                     )
+                    if subs:
+                        reminders.append(
+                            {
+                                "game_name": game_name,
+                                "update_date_str": update_date_str,
+                                "days_until": days_until,
+                                "version_name": info.get("version_name", ""),
+                                "version_code": info.get("version_code", ""),
+                                "subs": subs,
+                            }
+                        )
+            except ValueError:
+                logger.warning(
+                    f"[GameSub] 无法解析 {game_name} 的更新日期: {update_date_str}"
+                )
         return reminders
 
     # ------------------------------------------------------------------
@@ -1509,7 +1599,10 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
                     {
                         "user_id": user_id,
                         "game_name": reminder["game_name"],
-                        "version": reminder.get("version", ""),
+                        "days_until": reminder["days_until"],
+                        "update_date_str": reminder["update_date_str"],
+                        "version_name": reminder.get("version_name", ""),
+                        "version_code": reminder.get("version_code", ""),
                     }
                 )
 
@@ -1520,12 +1613,27 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
                 user_ids = set()
                 for item in items:
                     user_ids.add(item["user_id"])
-                    version_text = (
-                        f"（版本: {item['version']}）" if item["version"] else ""
-                    )
+
+                    # 版本描述
+                    ver_parts = []
+                    if item.get("version_name"):
+                        ver_parts.append(item["version_name"])
+                    if item.get("version_code"):
+                        ver_parts.append(item["version_code"])
+                    version_text = f"（{', '.join(ver_parts)}）" if ver_parts else ""
+
+                    # 倒计时描述
+                    days = item["days_until"]
+                    if days == 0:
+                        detail = f"🎉 今天更新！{version_text}"
+                    elif days > 0:
+                        detail = f"⏳ 还有 {days} 天更新{version_text}"
+                    else:
+                        continue
+
                     game_items.append({
                         "game_name": f"🔄 {item['game_name']}",
-                        "detail": f"今日有更新！{version_text}",
+                        "detail": detail,
                         "bg": "#fff0f6",
                         "border": "#f72585",
                     })
@@ -1554,14 +1662,21 @@ body{{font-family:'Microsoft YaHei','PingFang SC',-apple-system,sans-serif;
                     chain = []
                     for item in items:
                         chain.append(Comp.At(qq=item["user_id"]))
-                        version_text = (
-                            f"（版本: {item['version']}）" if item["version"] else ""
-                        )
                         chain.append(
-                            Comp.Plain(
-                                f" 🔄《{item['game_name']}》今日有更新！{version_text}\n"
+                                Comp.Plain(
+                                    f" 🔄《{item['game_name']}》"
+                                    + (
+                                        f"🎉 今天更新！" if item["days_until"] == 0
+                                        else f"⏳ 还有 {item['days_until']} 天更新"
+                                    )
+                                    + (
+                                        f"（{', '.join(filter(None, [item.get('version_name',''), item.get('version_code','')]))}）"
+                                        if item.get("version_name") or item.get("version_code")
+                                        else ""
+                                    )
+                                    + "\n"
+                                )
                             )
-                        )
                     if chain:
                         header = [Comp.Plain("📢 游戏更新提醒\n")]
                         message_chain = MessageChain()
